@@ -71,18 +71,10 @@ async fn main() {
     });
 
     // 5. Setup CORS policies
-    let mut cors = CorsLayer::new()
-        .allow_methods([axum::http::Method::GET])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
-
-    if config.allowed_origins.contains(&"*".to_string()) {
-        cors = cors.allow_origin(Any);
-    } else {
-        let origins: Vec<axum::http::HeaderValue> = config.allowed_origins.iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
-        cors = cors.allow_origin(origins);
-    }
+            let cors = CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any);
 
     // 6. Build application Router
     let app = Router::new()
