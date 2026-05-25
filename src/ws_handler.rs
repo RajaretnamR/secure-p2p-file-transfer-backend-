@@ -1,30 +1,40 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
-    response::IntoResponse,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     http::{HeaderMap, StatusCode},
+    response::IntoResponse,
 };
-use futures::{StreamExt, SinkExt};
-use uuid::Uuid;
+use futures::{SinkExt, StreamExt};
 use std::time::Instant;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
-use crate::state::{AppState, Peer};
-use crate::models::{ClientMessage, ServerMessage, VersionedServerMessage};
 use crate::errors::ErrorCode;
+use crate::models::{ClientMessage, ServerMessage, VersionedServerMessage};
+use crate::state::{AppState, Peer};
 
-/// Axum WebSocket handshake handler. Validates origin and connection caps.
+/// Axum WebSocket handshake handler
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // 1. Connection cap check
+    // Connection cap check
     if state.peers.len() >= state.config.max_connections {
-        warn!("Rejected WebSocket connection. Connection cap of {} reached.", state.config.max_connections);
-        return (StatusCode::SERVICE_UNAVAILABLE, "Server connection cap reached").into_response();
+        warn!(
+            "Rejected WebSocket connection. Connection cap {} reached.",
+            state.config.max_connections
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server connection cap reached",
+        )
+            .into_response();
     }
 
-    // 2. CORS / Origin validation
+    // Origin validation
     let origin = headers
         .get("origin")
         .and_then(|v| v.to_str().ok())
@@ -32,7 +42,7 @@ pub async fn websocket_handler(
 
     if state.config.environment == "production" {
         if !crate::security::is_origin_allowed(origin, &state.config.allowed_origins) {
-            warn!("Rejected WebSocket connection from unauthorized Origin: '{}'", origin);
+            warn!("Rejected WebSocket connection from forbidden origin: {}", origin);
             return (StatusCode::FORBIDDEN, "Forbidden Origin").into_response();
         }
     }
@@ -40,38 +50,42 @@ pub async fn websocket_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-/// Manages WebSocket read/write loops, rate limiting, and message sanitization
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let peer_id = Uuid::new_v4();
-    info!("New WebSocket connection established. Temporary peer ID: {}", peer_id);
+    info!("New WebSocket connection established: {}", peer_id);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VersionedServerMessage>();
-    
-    // Register peer in state
+
     if let Err(e) = state.add_peer(peer_id, tx.clone()) {
-        error!("Failed to add peer {} to state: {:?}", peer_id, e);
+        error!("Failed to add peer {}: {:?}", peer_id, e);
         return;
     }
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Write task: sends out messages queued in peer's mpsc receiver channel
-    let write_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let json_str = msg.to_json();
-            if ws_sender.send(Message::Text(json_str)).await.is_err() {
-                break;
-            }
-        }
-        info!("Write task shut down for peer {}", peer_id);
-    });
-
     let error_tx = tx.clone();
 
-    // Read loop: processes incoming frames from client
+    // WRITE TASK
+    let mut write_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let json = msg.to_json();
+
+            match ws_sender.send(Message::Text(json)).await {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Write task failed for peer {}: {}", peer_id, e);
+                    break;
+                }
+            }
+        }
+
+        info!("Write task ended for peer {}", peer_id);
+    });
+
+    // READ TASK
     let state_clone = state.clone();
-    let read_task = tokio::spawn(async move {
-        let state = state_clone;
+
+    let mut read_task = tokio::spawn(async move {
         while let Some(result) = ws_receiver.next().await {
             let msg = match result {
                 Ok(m) => m,
@@ -81,124 +95,186 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             };
 
-            // 1. Binary message rejection (immediate disconnect)
-            if let Message::Binary(_) = msg {
-                warn!("Peer {} sent binary data. Terminating connection immediately.", peer_id);
-                break;
-            }
-
-            if let Message::Close(_) = msg {
-                break;
-            }
-
-            if let Message::Text(text) = msg {
-                // 2. Max size validation (64KB cap)
-                if text.len() > state.config.max_message_size {
-                    warn!("Peer {} sent oversized message ({} bytes). Disconnecting.", peer_id, text.len());
-                    let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
-                        code: ErrorCode::RateLimitExceeded.as_str().to_string(),
-                        message: "Message size limit exceeded".to_string(),
-                    }));
+            match msg {
+                Message::Close(_) => {
+                    info!("Peer {} closed websocket", peer_id);
                     break;
                 }
 
-                // 3. Per-connection rate limiting
-                let rate_ok = {
-                    if let Some(mut peer) = state.peers.get_mut(&peer_id) {
-                        check_rate_limit(&mut peer)
-                    } else {
-                        false
-                    }
-                };
+                Message::Binary(_) => {
+                    warn!("Peer {} sent binary websocket data. Disconnecting.", peer_id);
 
-                if !rate_ok {
-                    warn!("Peer {} exceeded rate limit. Disconnecting.", peer_id);
-                    let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
-                        code: ErrorCode::RateLimitExceeded.as_str().to_string(),
-                        message: "Rate limit exceeded. Disconnecting.".to_string(),
-                    }));
-                    break;
-                }
-
-                // 4. Parse JSON
-                let parsed_val: Result<serde_json::Value, _> = serde_json::from_str(&text);
-                let val = match parsed_val {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("Peer {} sent malformed JSON: {}", peer_id, e);
-                        increment_bad_messages(&state, peer_id);
-                        let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
-                            code: ErrorCode::MalformedMessage.as_str().to_string(),
-                            message: format!("Invalid JSON: {}", e),
-                        }));
-                        if check_bad_messages(&state, peer_id) {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-
-                // 5. Check protocol version
-                let version = val.get("version").and_then(|v| v.as_str());
-                if version != Some("1") {
-                    warn!("Peer {} sent message with invalid or missing version: {:?}", peer_id, version);
-                    increment_bad_messages(&state, peer_id);
                     let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
                         code: ErrorCode::MalformedMessage.as_str().to_string(),
-                        message: "Missing or unsupported protocol version (expected '1')".to_string(),
+                        message: "Binary websocket frames are not allowed".to_string(),
                     }));
-                    if check_bad_messages(&state, peer_id) {
-                        break;
-                    }
+
+                    break;
+                }
+
+                Message::Ping(_) => {
                     continue;
                 }
 
-                // 6. Deserialize and handle message
-                match serde_json::from_value::<ClientMessage>(val) {
-                    Ok(client_msg) => {
-                        if let Err(err) = crate::signaling::handle_message(&state, peer_id, client_msg) {
-                            warn!("Error handling message from peer {}: {:?}", peer_id, err);
-                            
-                            if matches!(err.code, ErrorCode::Unauthorized | ErrorCode::InvalidSession | ErrorCode::InvalidRole) {
-                                increment_bad_messages(&state, peer_id);
-                            }
+                Message::Pong(_) => {
+                    continue;
+                }
 
-                            let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
-                                code: err.code.as_str().to_string(),
-                                message: err.message,
-                            }));
+                Message::Text(text) => {
+                    if text.len() > state_clone.config.max_message_size {
+                        warn!(
+                            "Peer {} sent oversized message: {} bytes",
+                            peer_id,
+                            text.len()
+                        );
 
-                            if check_bad_messages(&state, peer_id) {
+                        let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
+                            code: ErrorCode::RateLimitExceeded.as_str().to_string(),
+                            message: "Message too large".to_string(),
+                        }));
+
+                        break;
+                    }
+
+                    // Rate limit
+                    let rate_ok = {
+                        if let Some(mut peer) = state_clone.peers.get_mut(&peer_id) {
+                            check_rate_limit(&mut peer)
+                        } else {
+                            false
+                        }
+                    };
+
+                    if !rate_ok {
+                        warn!("Peer {} exceeded rate limit", peer_id);
+
+                        let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
+                            code: ErrorCode::RateLimitExceeded.as_str().to_string(),
+                            message: "Rate limit exceeded".to_string(),
+                        }));
+
+                        break;
+                    }
+
+                    // Parse JSON
+                    let parsed_val: Result<serde_json::Value, _> =
+                        serde_json::from_str(&text);
+
+                    let val = match parsed_val {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Malformed JSON from peer {}: {}", peer_id, e);
+
+                            increment_bad_messages(&state_clone, peer_id);
+
+                            let _ = error_tx.send(VersionedServerMessage::new(
+                                ServerMessage::Error {
+                                    code: ErrorCode::MalformedMessage.as_str().to_string(),
+                                    message: "Invalid JSON".to_string(),
+                                },
+                            ));
+
+                            if check_bad_messages(&state_clone, peer_id) {
                                 break;
                             }
+
+                            continue;
                         }
-                    }
-                    Err(e) => {
-                        warn!("Peer {} sent JSON with invalid schema: {}", peer_id, e);
-                        increment_bad_messages(&state, peer_id);
-                        let _ = error_tx.send(VersionedServerMessage::new(ServerMessage::Error {
-                            code: ErrorCode::MalformedMessage.as_str().to_string(),
-                            message: format!("Invalid message schema: {}", e),
-                        }));
-                        if check_bad_messages(&state, peer_id) {
+                    };
+
+                    // Version check
+                    let version = val.get("version").and_then(|v| v.as_str());
+
+                    if version != Some("1") {
+                        warn!("Invalid protocol version from peer {}", peer_id);
+
+                        increment_bad_messages(&state_clone, peer_id);
+
+                        let _ = error_tx.send(VersionedServerMessage::new(
+                            ServerMessage::Error {
+                                code: ErrorCode::MalformedMessage.as_str().to_string(),
+                                message: "Unsupported protocol version".to_string(),
+                            },
+                        ));
+
+                        if check_bad_messages(&state_clone, peer_id) {
                             break;
+                        }
+
+                        continue;
+                    }
+
+                    // Deserialize message
+                    match serde_json::from_value::<ClientMessage>(val) {
+                        Ok(client_msg) => {
+                            if let Err(err) =
+                                crate::signaling::handle_message(&state_clone, peer_id, client_msg)
+                            {
+                                warn!(
+                                    "Message handling error for peer {}: {:?}",
+                                    peer_id, err
+                                );
+
+                                let _ = error_tx.send(VersionedServerMessage::new(
+                                    ServerMessage::Error {
+                                        code: err.code.as_str().to_string(),
+                                        message: err.message,
+                                    },
+                                ));
+                            }
+                        }
+
+                        Err(e) => {
+                            warn!("Schema error from peer {}: {}", peer_id, e);
+
+                            increment_bad_messages(&state_clone, peer_id);
+
+                            let _ = error_tx.send(VersionedServerMessage::new(
+                                ServerMessage::Error {
+                                    code: ErrorCode::MalformedMessage.as_str().to_string(),
+                                    message: "Invalid schema".to_string(),
+                                },
+                            ));
+
+                            if check_bad_messages(&state_clone, peer_id) {
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
-        info!("Read task shut down for peer {}", peer_id);
+
+        info!("Read task ended for peer {}", peer_id);
     });
 
-    // Wait for either read task or write task to terminate
+    // Better lifecycle management
     tokio::select! {
-        _ = write_task => {},
-        _ = read_task => {},
+        _ = &mut read_task => {
+            warn!("Read task exited for peer {}", peer_id);
+            write_task.abort();
+        }
+
+        _ = &mut write_task => {
+            warn!("Write task exited for peer {}", peer_id);
+            read_task.abort();
+        }
     }
 
-    // Clean up peer state and notify session partner
-    info!("Tearing down connection for peer {}", peer_id);
+    // Grace period before cleanup
+    info!("Grace cleanup wait for peer {}", peer_id);
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // If peer already removed, skip
+    if !state.peers.contains_key(&peer_id) {
+        info!("Peer {} already cleaned up", peer_id);
+        return;
+    }
+
+    info!("Final cleanup for peer {}", peer_id);
+
     let notifications = state.remove_peer(peer_id);
+
     for (target_id, msg) in notifications {
         if let Some(peer) = state.peers.get(&target_id) {
             let _ = peer.tx.send(msg);
@@ -206,14 +282,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 }
 
-/// Token bucket check: replenishes 1 token per second, max 30 tokens
+/// Rate limiter
 fn check_rate_limit(peer: &mut Peer) -> bool {
     let now = Instant::now();
     let elapsed = now.duration_since(peer.rate_limit_last_check).as_secs();
+
     if elapsed > 0 {
-        peer.rate_limit_tokens = std::cmp::min(30, peer.rate_limit_tokens + elapsed as usize);
+        peer.rate_limit_tokens =
+            std::cmp::min(30, peer.rate_limit_tokens + elapsed as usize);
         peer.rate_limit_last_check = now;
     }
+
     if peer.rate_limit_tokens == 0 {
         false
     } else {
@@ -230,12 +309,7 @@ fn increment_bad_messages(state: &AppState, peer_id: Uuid) {
 
 fn check_bad_messages(state: &AppState, peer_id: Uuid) -> bool {
     if let Some(peer) = state.peers.get(&peer_id) {
-        if peer.bad_message_count >= 3 {
-            warn!("Peer {} disconnected: reached bad message threshold", peer_id);
-            true
-        } else {
-            false
-        }
+        peer.bad_message_count >= 3
     } else {
         true
     }

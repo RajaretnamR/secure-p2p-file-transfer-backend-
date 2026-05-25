@@ -89,40 +89,71 @@ impl AppState {
     }
 
     /// Create session for a sender
-    pub fn create_session(&self, sender_id: Uuid) -> Result<(String, String), AppError> {
-        let mut sender_peer = self.peers.get_mut(&sender_id).ok_or_else(|| {
-            AppError::new(ErrorCode::NotRegistered, "Peer not registered")
-        })?;
+pub fn create_session(&self, sender_id: Uuid) -> Result<(String, String), AppError> {
+    let mut sender_peer = self.peers.get_mut(&sender_id).ok_or_else(|| {
+        AppError::new(ErrorCode::NotRegistered, "Peer not registered")
+    })?;
 
-        if sender_peer.role != Some(Role::Sender) {
-            return Err(AppError::new(ErrorCode::InvalidRole, "Only registered Senders can create sessions"));
-        }
-
-        if sender_peer.session_id.is_some() {
-            return Err(AppError::new(ErrorCode::AlreadyRegistered, "Sender already has an active session"));
-        }
-
-        let transfer_id = crate::security::generate_transfer_id();
-        let token = crate::security::generate_secure_token();
-        
-        let now = Instant::now();
-        let expires_at = now + Duration::from_secs(self.config.session_timeout_minutes * 60);
-
-        let session = Session {
-            transfer_id: transfer_id.clone(),
-            token: token.clone(),
-            sender_id: Some(sender_id),
-            receiver_id: None,
-            created_at: now,
-            expires_at,
-        };
-
-        self.sessions.insert(transfer_id.clone(), session);
-        sender_peer.session_id = Some(transfer_id.clone());
-
-        info!("Session created. transfer_id={}, sender_id={}", transfer_id, sender_id);
-        Ok((transfer_id, token))
+    if sender_peer.role != Some(Role::Sender) {
+        return Err(AppError::new(
+            ErrorCode::InvalidRole,
+            "Only registered Senders can create sessions",
+        ));
     }
+
+    // reconnect recovery
+    for mut session in self.sessions.iter_mut() {
+        if session.sender_id.is_none() && session.receiver_id.is_none() {
+            session.sender_id = Some(sender_id);
+            sender_peer.session_id = Some(session.transfer_id.clone());
+
+            info!(
+                "Recovered orphan session {} for sender {}",
+                session.transfer_id,
+                sender_id
+            );
+
+            return Ok((
+                session.transfer_id.clone(),
+                session.token.clone(),
+            ));
+        }
+    }
+
+    if sender_peer.session_id.is_some() {
+        return Err(AppError::new(
+            ErrorCode::AlreadyRegistered,
+            "Sender already has an active session",
+        ));
+    }
+
+    let transfer_id = crate::security::generate_transfer_id();
+    let token = crate::security::generate_secure_token();
+
+    let now = Instant::now();
+    let expires_at =
+        now + Duration::from_secs(self.config.session_timeout_minutes * 60);
+
+    let session = Session {
+        transfer_id: transfer_id.clone(),
+        token: token.clone(),
+        sender_id: Some(sender_id),
+        receiver_id: None,
+        created_at: now,
+        expires_at,
+    };
+
+    self.sessions.insert(transfer_id.clone(), session);
+    sender_peer.session_id = Some(transfer_id.clone());
+
+    info!(
+        "Session created. transfer_id={}, sender_id={}",
+        transfer_id,
+        sender_id
+    );
+
+    Ok((transfer_id, token))
+}
 
     /// Receiver requests to join a session. Returns the Sender's UUID to notify them.
     pub fn request_join_session(&self, receiver_id: Uuid, transfer_id: &str) -> Result<Uuid, AppError> {
@@ -205,50 +236,65 @@ impl AppState {
     }
 
     /// Handles disconnection of a peer, cleaning up references and returning pending notifications
-    pub fn remove_peer(&self, peer_id: Uuid) -> Vec<(Uuid, VersionedServerMessage)> {
-        let mut notifications = Vec::new();
-        
-        if let Some((_, peer)) = self.peers.remove(&peer_id) {
-            info!("Peer removed: {}", peer_id);
-            if let Some(transfer_id) = peer.session_id {
-                if let Some(mut session) = self.sessions.get_mut(&transfer_id) {
-                    if Some(peer_id) == session.sender_id {
-                        // Sender disconnected -> Close session completely, clear receiver association
-                        session.sender_id = None;
-                        if let Some(receiver_id) = session.receiver_id {
-                            if let Some(mut rec_peer) = self.peers.get_mut(&receiver_id) {
-                                rec_peer.session_id = None;
-                            }
-                            notifications.push((
-                                receiver_id,
-                                VersionedServerMessage::new(ServerMessage::PeerDisconnected {
-                                    peer_id: peer_id.to_string(),
-                                    role: Role::Sender,
-                                }),
-                            ));
+pub fn remove_peer(&self, peer_id: Uuid) -> Vec<(Uuid, VersionedServerMessage)> {
+    let mut notifications = Vec::new();
+
+    if let Some((_, peer)) = self.peers.remove(&peer_id) {
+        info!("Peer removed: {}", peer_id);
+
+        if let Some(transfer_id) = peer.session_id {
+            if let Some(mut session) = self.sessions.get_mut(&transfer_id) {
+
+                // SENDER DISCONNECTED
+                if Some(peer_id) == session.sender_id {
+                    session.sender_id = None;
+
+                    if let Some(receiver_id) = session.receiver_id {
+                        if let Some(mut rec_peer) = self.peers.get_mut(&receiver_id) {
+                            rec_peer.session_id = None;
                         }
-                        drop(session);
-                        self.sessions.remove(&transfer_id);
-                        info!("Session {} closed because sender disconnected.", transfer_id);
-                    } else if Some(peer_id) == session.receiver_id {
-                        // Receiver disconnected -> Notify sender, clear receiver, session remains open for reconnect
-                        session.receiver_id = None;
-                        if let Some(sender_id) = session.sender_id {
-                            notifications.push((
-                                sender_id,
-                                VersionedServerMessage::new(ServerMessage::PeerDisconnected {
-                                    peer_id: peer_id.to_string(),
-                                    role: Role::Receiver,
-                                }),
-                            ));
-                        }
-                        info!("Receiver disconnected from session {}. Session kept open.", transfer_id);
+
+                        notifications.push((
+                            receiver_id,
+                            VersionedServerMessage::new(ServerMessage::PeerDisconnected {
+                                peer_id: peer_id.to_string(),
+                                role: Role::Sender,
+                            }),
+                        ));
                     }
+
+                    info!(
+                        "Sender {} disconnected temporarily. Session {} kept alive for reconnect.",
+                        peer_id,
+                        transfer_id
+                    );
+                }
+
+                // RECEIVER DISCONNECTED
+                else if Some(peer_id) == session.receiver_id {
+                    session.receiver_id = None;
+
+                    if let Some(sender_id) = session.sender_id {
+                        notifications.push((
+                            sender_id,
+                            VersionedServerMessage::new(ServerMessage::PeerDisconnected {
+                                peer_id: peer_id.to_string(),
+                                role: Role::Receiver,
+                            }),
+                        ));
+                    }
+
+                    info!(
+                        "Receiver disconnected from session {}. Session remains active.",
+                        transfer_id
+                    );
                 }
             }
         }
-        notifications
     }
+
+    notifications
+}
 
     /// Background task cleanup: purge stale sessions and inactive peers
     pub fn cleanup_stale(&self) -> Vec<(Uuid, VersionedServerMessage)> {
