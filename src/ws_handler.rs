@@ -38,23 +38,24 @@ pub async fn websocket_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if state.config.environment == "production" {
-        if !crate::security::is_origin_allowed(
-            origin,
-            &state.config.allowed_origins,
-        ) {
-            warn!(
-                "Rejected forbidden origin websocket connection: {}",
-                origin
-            );
+// TEMP DEBUG: disable origin validation
+if false {
+    if !crate::security::is_origin_allowed(
+        origin,
+        &state.config.allowed_origins,
+    ) {
+        warn!(
+            "Rejected forbidden origin websocket connection: {}",
+            origin
+        );
 
-            return (
-                StatusCode::FORBIDDEN,
-                "Forbidden Origin",
-            )
-                .into_response();
-        }
+        return (
+            StatusCode::FORBIDDEN,
+            "Forbidden Origin",
+        )
+            .into_response();
     }
+}
 
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
