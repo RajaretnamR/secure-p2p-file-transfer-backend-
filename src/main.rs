@@ -80,6 +80,7 @@ async fn main() {
     let app = Router::new()
         .route("/ws", get(ws_handler::websocket_handler))
         .route("/api/config", get(get_config))
+        .route("/health", get(|| async { "OK" }))
         .layer(cors)
         .with_state(state.clone());
 
